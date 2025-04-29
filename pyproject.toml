@@ -1,0 +1,28 @@
+[project]
+name = "haplomatic"
+version = "0.1.1"
+description = "Adaptive-resolution haplotype frequency estimator"
+authors = [
+  { name="Tyler Douglas", email="tylerdouglase@gmail.com" }
+]
+readme = "README.md"
+dependencies = [
+"pandas>=1.3",
+  "numpy>=1.21",
+  "scipy>=1.7",
+  "jax>=0.4",
+  "jaxlib>=0.4",
+  "numpyro>=0.10",
+  "torch>=1.13",
+  "scikit-learn>=1.0",
+  "biopython>=1.79"
+]
+
+[project.scripts]
+haplomatic-sim    = "haplomatic.sim:main"
+haplomatic-window = "haplomatic.windows:main"
+haplomatic-train  = "haplomatic.trainer:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

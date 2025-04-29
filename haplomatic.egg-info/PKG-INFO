@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: haplomatic
+Version: 0.1.1
+Summary: Adaptive-resolution haplotype frequency estimator
+Author-email: Tyler Douglas <tylerdouglase@gmail.com>
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=1.3
+Requires-Dist: numpy>=1.21
+Requires-Dist: scipy>=1.7
+Requires-Dist: jax>=0.4
+Requires-Dist: jaxlib>=0.4
+Requires-Dist: numpyro>=0.10
+Requires-Dist: torch>=1.13
+Requires-Dist: scikit-learn>=1.0
+Requires-Dist: biopython>=1.79

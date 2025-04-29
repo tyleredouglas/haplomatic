@@ -1,0 +1,4 @@
+[console_scripts]
+haplomatic-sim = haplomatic.sim:main
+haplomatic-train = haplomatic.trainer:main
+haplomatic-window = haplomatic.windows:main

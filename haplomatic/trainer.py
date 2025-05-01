@@ -7,7 +7,7 @@ import os, sys, argparse, math, time
 import numpy  as np
 import pandas as pd
 import numpy._core.multiarray as marray
-from torch.serialization     
+from torch.serialization import add_safe_globals 
 import add_safe_globals
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score

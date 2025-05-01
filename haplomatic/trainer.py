@@ -8,7 +8,6 @@ import numpy  as np
 import pandas as pd
 import numpy._core.multiarray as marray
 from torch.serialization import add_safe_globals 
-import add_safe_globals
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score
 

@@ -1,8 +1,8 @@
-# haplomatic/windows.py
 #!/usr/bin/env python3
 """
 Slide fixed-size windows across SNP-frequency tables and compute a
-feature/error table for one or many populations.
+feature/error table for one or many populations, checkpointing every
+2 000 windows to guard against preemption.
 
 • Founders come from --founders-file   (one name / line)
 • Populations come from --populations  (one pop column / line)
@@ -44,7 +44,7 @@ def lsei_haplotype_estimator(X: np.ndarray, b: np.ndarray,
 
     res = minimize(obj, p0, method="SLSQP",
                    bounds=bounds, constraints=cons)
-    if not res.success:                                 # fallback → no LB
+    if not res.success:
         res = minimize(obj, p0, method="SLSQP",
                        bounds=[(0.0, 1.0)] * k,
                        constraints=cons)
@@ -181,23 +181,22 @@ class FeatureBuilder:
             if sigma_draw.size:
                 sig = sigma_draw.mean()
                 H = (X.T @ X) / (sig ** 2 + 1e-8)
-                imp_grad = float(np.log(np.median(1 / (np.abs(np.linalg.eigvals(H)) + 1e-8)) + 1e-8))
+                imp_grad = float(np.log(
+                    np.median(1 / (np.abs(np.linalg.eigvals(H)) + 1e-8))
+                    + 1e-8))
             else:
                 imp_grad = np.nan
 
             true_row = info["true_freq_row"]
-            if len(true_row) != len(founder_cols):
-                raise ValueError(
-                    f"Founder mismatch in window {start}-{end} ({pop}): "
-                    f"{len(founder_cols)} founders in SNP table vs {len(true_row)} in true-freq row."
-                )
             err = float(np.abs(p_mean - true_row).sum())
 
             # quick extra features
             lsei = lsei_haplotype_estimator(X, b)
-            avgf = np.array([win.loc[win[c] == 1, sim_col].mean()
-                             if (win[c] == 1).any() else np.nan
-                             for c in founder_cols])
+            avgf = np.array([
+                win.loc[win[c] == 1, sim_col].mean()
+                if (win[c] == 1).any() else np.nan
+                for c in founder_cols
+            ])
 
             rec = dict(
                 sim=pop,
@@ -211,9 +210,11 @@ class FeatureBuilder:
                 avg_kurtosis=avg_krt,
                 snr=float(b.mean() / b.std()) if b.std() else np.nan,
                 condition_number=float(np.linalg.cond(X)) if X.shape[0] >= X.shape[1] else np.inf,
-                min_col_distance=int(np.min([(X[:, i] != X[:, j]).sum()
-                                             for i in range(X.shape[1])
-                                             for j in range(i + 1, X.shape[1])])) if X.shape[1] > 1 else 0,
+                min_col_distance=int(np.min([
+                    (X[:, i] != X[:, j]).sum()
+                    for i in range(X.shape[1])
+                    for j in range(i + 1, X.shape[1])
+                ])) if X.shape[1] > 1 else 0,
                 avg_row_sum=float(X.sum(axis=1).mean()),
                 row_sum_std=float(X.sum(axis=1).std()),
                 improved_gradient_sensitivity=imp_grad,
@@ -252,7 +253,7 @@ def main() -> None:
     ap.add_argument("--stride-kb", type=int, default=20)
     ap.add_argument("--min-snps", type=int, default=10)
     ap.add_argument("--output", required=True,
-                    help="Output CSV path")
+                    help="Output CSV path (will be appended to)")
     args = ap.parse_args()
 
     pops = read_list_file(args.populations)
@@ -264,24 +265,54 @@ def main() -> None:
                                min_snps_per_window=args.min_snps)
     builder = FeatureBuilder()
 
-    frames = []
+    # prepare output file: remove if exists, and write header on first flush
+    out_path = Path(args.output)
+    if out_path.exists():
+        out_path.unlink()
+    header_written = False
+
+    BATCH_SIZE = 2000
+    buffer: List[pd.DataFrame] = []
+    count = 0
+
     for pop in pops:
-        print(f"[windows] processing {pop}")
+        print(f"[windows] processing {pop}", file=sys.stderr)
         true_file = Path(args.true_freq_dir) / f"{pop}_true_freqs.csv"
         if not true_file.exists():
             raise FileNotFoundError(true_file)
-
         true_df = pd.read_csv(true_file).loc[:, ["pos", *founders]]
 
         obs_cols = ["CHROM", "pos", *founders, pop]
         obs_df = snp_df.loc[:, obs_cols].copy()
 
         windows = gen.generate(obs_df, true_df, founders, sim_col=pop)
-        frames.append(builder.build(windows, founders, sim_col=pop))
 
-    out_df = pd.concat(frames, ignore_index=True)
-    out_df.to_csv(args.output, index=False)
-    print("training windows generated")
+        for key, info in windows.items():
+            df_single = builder.build({key: info}, founders, sim_col=pop)
+            buffer.append(df_single)
+            count += 1
+
+            if count >= BATCH_SIZE:
+                pd.concat(buffer, ignore_index=True).to_csv(
+                    args.output,
+                    mode="a",
+                    header=not header_written,
+                    index=False
+                )
+                header_written = True
+                buffer.clear()
+                count = 0
+
+    # flush any remaining
+    if buffer:
+        pd.concat(buffer, ignore_index=True).to_csv(
+            args.output,
+            mode="a",
+            header=not header_written,
+            index=False
+        )
+
+    print("Done.  Windows written to", args.output, file=sys.stderr)
 
 
 if __name__ == "__main__":

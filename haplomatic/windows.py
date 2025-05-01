@@ -15,6 +15,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, Tuple, List
 import sys
+from concurrent.futures import ProcessPoolExecutor
 
 import jax
 import jax.numpy as jnp
@@ -83,15 +84,16 @@ class FixedWindowGenerator:
         while anchor + self.window_sizes_bp[0] <= max_pos:
             for size in self.window_sizes_bp:
                 start, end = anchor, anchor + size
-                if end > max_pos: continue
+                if end > max_pos:
+                    continue
                 win_df = obs.query("@start <= pos < @end").reset_index(drop=True)
-                if len(win_df) < self.min_snps: continue
+                if len(win_df) < self.min_snps:
+                    continue
                 mid_idx = (true_freqs.pos - win_df.pos.median()).abs().idxmin()
                 true_row = true_freqs.loc[mid_idx, founder_cols].values
                 results[(sim_col,(start,end))] = {
                     "window": win_df,
-                    "true_freq_row": true_row,
-                    "window_size_bp": size
+                    "true_freq_row": true_row
                 }
             anchor += self.stride_bp
         return results
@@ -186,7 +188,7 @@ class FeatureBuilder:
               effective_rank=compute_effective_rank(X),
               divergence_rate=div_rt,
               avg_tree_depth=td,
-              Predicted_Error=float(np.nan),  # will fill in later if needed
+              Predicted_Error=float(np.nan),  # placeholder
               True_Error=err
             )
             for i,c in enumerate(founder_cols):
@@ -196,26 +198,36 @@ class FeatureBuilder:
         return pd.DataFrame.from_records(recs)
 
 
+# ───────────────────────────── worker fn ───────────────────────────── #
+
+def _worker_build(args):
+    key, info, founders, pop = args
+    fb = FeatureBuilder()
+    return fb.build({ key: info }, founders, pop)
+
+
 # ────────────────────────────────── main ─────────────────────────────────── #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="haplomatic-window",
-        description="Produce sliding-window feature tables with resume support.")
-    ap.add_argument("--populations",  required=True,
-                    help="one sim name per line")
-    ap.add_argument("--founders-file",required=True,
-                    help="one founder name per line")
-    ap.add_argument("--snp-freqs",    required=True,
-                    help="CSV with CHROM,pos,<founders>,<sims…>")
-    ap.add_argument("--true-freq-dir",required=True,
-                    help="dir with <pop>_true_freqs.csv")
-    ap.add_argument("--window-sizes-kb",nargs="+",type=int,
-                    default=[30,50,70,90,120,150,200,250])
-    ap.add_argument("--stride-kb",    type=int, default=20)
-    ap.add_argument("--min-snps",     type=int, default=10)
-    ap.add_argument("--output",       required=True,
-                    help="path to output CSV (appended to)")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser(prog="haplomatic-window",
+        description="Sliding-window feature tables with resume + parallelism.")
+    p.add_argument("--populations",    required=True,
+                   help="one sim name per line")
+    p.add_argument("--founders-file",  required=True,
+                   help="one founder name per line")
+    p.add_argument("--snp-freqs",      required=True,
+                   help="CSV with CHROM,pos,<founders>,<sims…>")
+    p.add_argument("--true-freq-dir",  required=True,
+                   help="dir with <pop>_true_freqs.csv")
+    p.add_argument("--window-sizes-kb",nargs="+",type=int,
+                   default=[30,50,70,90,120,150,200,250])
+    p.add_argument("--stride-kb",      type=int, default=20)
+    p.add_argument("--min-snps",       type=int, default=10)
+    p.add_argument("--output",         required=True,
+                   help="path to output CSV (appended to)")
+    p.add_argument("--workers",        type=int, default=1,
+                   help="number of parallel worker processes")
+    args = p.parse_args()
 
     pops     = read_list_file(args.populations)
     founders = read_list_file(args.founders_file)
@@ -224,21 +236,20 @@ def main() -> None:
     gen     = FixedWindowGenerator(tuple(args.window_sizes_kb),
                                    stride_kb=args.stride_kb,
                                    min_snps_per_window=args.min_snps)
-    builder = FeatureBuilder()
-
     out_path       = Path(args.output)
     header_written = out_path.exists()
 
-    # load already-done windows
+    # resume set
     done = set()
     if header_written:
         prev = pd.read_csv(out_path, usecols=["sim","start","end"])
         done = set(zip(prev.sim, prev.start, prev.end))
 
     BATCH_SIZE = 2000
-    buffer: List[pd.DataFrame] = []
-    count = 0
+    workers    = args.workers
+    pool       = ProcessPoolExecutor(max_workers=workers) if workers>1 else None
 
+    # iterate populations
     for pop in pops:
         print(f"[windows] processing {pop}", file=sys.stderr)
         tf = Path(args.true_freq_dir)/f"{pop}_true_freqs.csv"
@@ -246,42 +257,39 @@ def main() -> None:
             raise FileNotFoundError(tf)
         true_df = pd.read_csv(tf).loc[:,["pos",*founders]]
 
-        obs_cols = ["CHROM","pos",*founders,pop]
-        obs_df   = snp_df.loc[:,obs_cols].copy()
-
-        windows = gen.generate(obs_df,true_df,founders,sim_col=pop)
-
-        for key,info in windows.items():
-            sim,(start,end) = key
-            if (sim,start,end) in done:
-                continue
-            df_single = builder.build({key:info},founders,sim_col=pop)
-            buffer.append(df_single)
-            count += 1
-            done.add((sim,start,end))
-
-            if count >= BATCH_SIZE:
-                pd.concat(buffer,ignore_index=True).to_csv(
-                    out_path,
-                    mode="a",
-                    header=not header_written,
-                    index=False
-                )
-                header_written = True
-                buffer.clear()
-                count = 0
-
-    # flush any remainder
-    if buffer:
-        pd.concat(buffer,ignore_index=True).to_csv(
-            out_path,
-            mode="a",
-            header=not header_written,
-            index=False
+        # build task list
+        windows = gen.generate(
+            snp_df.loc[:, ["CHROM","pos", *founders, pop]].copy(),
+            true_df, founders, sim_col=pop
         )
+        tasks = [
+            (key, info, founders, pop)
+            for key,info in windows.items()
+            if (pop, key[1][0], key[1][1]) not in done
+        ]
+
+        # process in batches
+        for i in range(0, len(tasks), BATCH_SIZE):
+            batch = tasks[i:i+BATCH_SIZE]
+            if pool:
+                dfs = list(pool.map(_worker_build, batch))
+            else:
+                dfs = [ _worker_build(t) for t in batch ]
+            chunk = pd.concat(dfs, ignore_index=True)
+
+            chunk.to_csv(
+                out_path,
+                mode="a",
+                header=not header_written,
+                index=False
+            )
+            header_written = True
+
+            # mark as done
+            for key,_,_,pop in batch:
+                done.add((pop, key[1][0], key[1][1]))
 
     print("Done. windows written to", out_path, file=sys.stderr)
-
 
 if __name__=="__main__":
     main()

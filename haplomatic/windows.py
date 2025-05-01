@@ -5,10 +5,10 @@ feature/error table for one or many populations, checkpointing every
 2 000 windows to guard against preemption—and resuming from any
 already-written windows in the output CSV on re-launch.
 
-• Populations:  one sim name per line in --populations
-• Founders:     one founder name per line in --founders-file
-• SNP freqs:    CSV with columns chrom,pos,<founders…>,<pop1>,<pop2>…
-• True freqs:   files <pop>_true_freqs.csv in --true-freq-dir
+• Populations:  one sim name per line in --populations  
+• Founders:     one founder name per line in --founders-file  
+• SNP freqs:    CSV with columns CHROM,pos,<founders…>,<pop1>,<pop2>…  
+• True freqs:   files <pop>_true_freqs.csv in --true-freq-dir  
 """
 
 import argparse
@@ -54,9 +54,14 @@ def compute_effective_rank(X: np.ndarray) -> float:
     ent    = -np.sum(s_norm*np.log(s_norm+1e-8))
     return float(np.exp(ent))
 
+
 # ─────────────────────────── window generation ───────────────────────────── #
 
 class FixedWindowGenerator:
+    """
+    Slide every size in window_sizes_kb (converted to bp) across the SNP table
+    with stride_kb, collecting SNP rows for each window.
+    """
     def __init__(self,
                  window_sizes_kb: Tuple[int, ...],
                  stride_kb: int = 20,
@@ -91,9 +96,13 @@ class FixedWindowGenerator:
             anchor += self.stride_bp
         return results
 
+
 # ───────────────────────────── Feature builder ───────────────────────────── #
 
 class FeatureBuilder:
+    """
+    Builds the feature/error records using a single NUTS chain.
+    """
     def __init__(self,
                  num_warmup: int = 100,
                  num_samples: int = 100,
@@ -128,32 +137,36 @@ class FeatureBuilder:
               windows: Dict[Tuple[str, Tuple[int,int]], Dict],
               founder_cols: List[str],
               sim_col: str) -> pd.DataFrame:
-
         recs = []
         for (pop,(start,end)), info in windows.items():
             win = info["window"]
             X   = win[founder_cols].to_numpy(float)
             b   = win[sim_col].to_numpy(float)
-            p_draw,sigma,div_rt,td = self._posterior_p(X,b)
+
+            p_draw, sigma_draw, div_rt, td = self._posterior_p(X,b)
             p_mean = p_draw.mean(axis=0)
             p_std  = p_draw.std(axis=0)
-            avg_unc= p_std.mean()
-            avg_skw= skew(p_draw).mean()
-            avg_krt= kurtosis(p_draw).mean()
-            sig    = sigma.mean() if sigma.size else 1.0
-            H      = (X.T@X)/(sig**2+1e-8)
-            imp_g  = float(np.log(np.median(1/(np.abs(np.linalg.eigvals(H))+1e-8))+1e-8))
-            err    = float(np.abs(p_mean - info["true_freq_row"]).sum())
 
+            # core features
+            avg_unc = p_std.mean()
+            avg_skw = skew(p_draw).mean()
+            avg_krt = kurtosis(p_draw).mean()
+            sig     = sigma_draw.mean() if sigma_draw.size else 1.0
+            H       = (X.T@X)/(sig**2+1e-8)
+            imp_g   = float(np.log(np.median(1/(np.abs(np.linalg.eigvals(H))+1e-8))+1e-8))
+            err     = float(np.abs(p_mean - info["true_freq_row"]).sum())
+
+            # LSEI + avg SNP‐freq
             lsei = lsei_haplotype_estimator(X,b)
             avgf = np.array([
-                win.loc[win[c]==1,sim_col].mean() if (win[c]==1).any() else np.nan
+                win.loc[win[c]==1,sim_col].mean()
+                if (win[c]==1).any() else np.nan
                 for c in founder_cols
             ])
 
             rec = dict(
               sim=pop,
-              chrom=win["chrom"].iloc[0],
+              chrom=win["CHROM"].iloc[0],
               start=start,
               end=end,
               window_bp=end-start+1,
@@ -173,7 +186,7 @@ class FeatureBuilder:
               effective_rank=compute_effective_rank(X),
               divergence_rate=div_rt,
               avg_tree_depth=td,
-              Predicted_Error=float(np.nan),  # placeholder
+              Predicted_Error=float(np.nan),  # will fill in later if needed
               True_Error=err
             )
             for i,c in enumerate(founder_cols):
@@ -182,16 +195,18 @@ class FeatureBuilder:
             recs.append(rec)
         return pd.DataFrame.from_records(recs)
 
+
 # ────────────────────────────────── main ─────────────────────────────────── #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="haplomatic-window")
+    ap = argparse.ArgumentParser(prog="haplomatic-window",
+        description="Produce sliding-window feature tables with resume support.")
     ap.add_argument("--populations",  required=True,
                     help="one sim name per line")
     ap.add_argument("--founders-file",required=True,
                     help="one founder name per line")
     ap.add_argument("--snp-freqs",    required=True,
-                    help="CSV with chrom,pos,<founders>,<sims…>")
+                    help="CSV with CHROM,pos,<founders>,<sims…>")
     ap.add_argument("--true-freq-dir",required=True,
                     help="dir with <pop>_true_freqs.csv")
     ap.add_argument("--window-sizes-kb",nargs="+",type=int,
@@ -205,23 +220,24 @@ def main() -> None:
     pops     = read_list_file(args.populations)
     founders = read_list_file(args.founders_file)
     snp_df   = pd.read_csv(args.snp_freqs)
-    gen      = FixedWindowGenerator(tuple(args.window_sizes_kb),
-                                    stride_kb=args.stride_kb,
-                                    min_snps_per_window=args.min_snps)
-    builder  = FeatureBuilder()
 
-    out_path = Path(args.output)
+    gen     = FixedWindowGenerator(tuple(args.window_sizes_kb),
+                                   stride_kb=args.stride_kb,
+                                   min_snps_per_window=args.min_snps)
+    builder = FeatureBuilder()
 
-    # — load already-done windows
+    out_path       = Path(args.output)
+    header_written = out_path.exists()
+
+    # load already-done windows
     done = set()
-    if out_path.exists():
+    if header_written:
         prev = pd.read_csv(out_path, usecols=["sim","start","end"])
         done = set(zip(prev.sim, prev.start, prev.end))
 
     BATCH_SIZE = 2000
     buffer: List[pd.DataFrame] = []
     count = 0
-    header_written = out_path.exists()
 
     for pop in pops:
         print(f"[windows] processing {pop}", file=sys.stderr)
@@ -230,13 +246,13 @@ def main() -> None:
             raise FileNotFoundError(tf)
         true_df = pd.read_csv(tf).loc[:,["pos",*founders]]
 
-        obs_cols= ["chrom","pos",*founders,pop]
-        obs_df  = snp_df.loc[:,obs_cols].copy()
+        obs_cols = ["CHROM","pos",*founders,pop]
+        obs_df   = snp_df.loc[:,obs_cols].copy()
 
         windows = gen.generate(obs_df,true_df,founders,sim_col=pop)
 
         for key,info in windows.items():
-            sim,(start,end)= key
+            sim,(start,end) = key
             if (sim,start,end) in done:
                 continue
             df_single = builder.build({key:info},founders,sim_col=pop)
@@ -255,7 +271,7 @@ def main() -> None:
                 buffer.clear()
                 count = 0
 
-    # flush remainder
+    # flush any remainder
     if buffer:
         pd.concat(buffer,ignore_index=True).to_csv(
             out_path,
@@ -264,7 +280,7 @@ def main() -> None:
             index=False
         )
 
-    print("Done. windows written to",out_path, file=sys.stderr)
+    print("Done. windows written to", out_path, file=sys.stderr)
 
 
 if __name__=="__main__":

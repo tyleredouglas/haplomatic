@@ -6,7 +6,9 @@
 import os, sys, argparse, math, time
 import numpy  as np
 import pandas as pd
-
+import numpy._core.multiarray as marray
+from torch.serialization     
+import add_safe_globals
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score
 
@@ -225,7 +227,13 @@ def main():
 
     # --- resume if checkpoint exists ---
     if os.path.exists(args.ckpt):
-        ck = torch.load(args.ckpt, map_location=device)
+        # allow full-pickle load of numpy arrays in our checkpoint
+        add_safe_globals([marray._reconstruct])
+        ck = torch.load(
+            args.ckpt,
+            map_location=device,
+            weights_only=False
+        )
         model.load_state_dict(ck["model_state_dict"])
         opt.load_state_dict(ck["opt_state_dict"])
         gscaler.load_state_dict(ck["gscaler"])

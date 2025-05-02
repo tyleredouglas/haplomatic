@@ -7,6 +7,7 @@ import os
 import sys
 import argparse
 import math
+import time
 
 import numpy  as np
 import pandas as pd
@@ -226,13 +227,13 @@ def main():
     if args.region:
         feat_df = feat_df.query("chrom == @args.region").reset_index(drop=True)
 
-    # —— replace infinities with NaN, then drop any row containing a NaN
-    X_df = feat_df[feat_cols].replace([np.inf, -np.inf], np.nan)
-    mask = ~X_df.isna().any(axis=1)
-    feat_df = feat_df.loc[mask].reset_index(drop=True)
-    X_tab   = X_df.loc[mask].values
+    # — correct NaN‐masking here —
+    X_tab_df = feat_df[feat_cols].replace([np.inf, -np.inf], np.nan)
+    mask     = ~X_tab_df.isna().any(axis=1)
+    feat_df  = feat_df.loc[mask].reset_index(drop=True)
+    X_tab    = X_tab_df.loc[mask].values
 
-    y_all = feat_df["error"].clip(lower=1e-8).values
+    y_all    = feat_df["error"].clip(lower=1e-8).values
 
     snp_df = pd.read_csv(args.snp_freqs_csv)
     if args.region:
@@ -272,13 +273,13 @@ def main():
                              dropout=args.dropout
                             ).to(device)
 
-    opt     = optim.Adam(model.parameters(),
-                         lr=args.lr,
-                         weight_decay=args.weight_decay)
-    sched   = optim.lr_scheduler.ReduceLROnPlateau(opt,
-                                                  'min',
-                                                  patience=4)
-    gscaler = GradScaler()
+    opt    = optim.Adam(model.parameters(),
+                        lr=args.lr,
+                        weight_decay=args.weight_decay)
+    sched  = optim.lr_scheduler.ReduceLROnPlateau(opt,
+                                                 'min',
+                                                 patience=4)
+    gscaler= GradScaler()
 
     # resume?
     start_epoch, best_r2, history = 1, -math.inf, []
@@ -318,6 +319,5 @@ def main():
 
     print("[trainer] done ✓", file=sys.stderr)
 
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

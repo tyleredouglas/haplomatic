@@ -7,7 +7,6 @@ import os
 import sys
 import argparse
 import math
-import time
 
 import numpy  as np
 import pandas as pd
@@ -24,10 +23,11 @@ import torch.optim as optim
 from   torch.utils.data    import Dataset, DataLoader
 from   torch.cuda.amp      import autocast, GradScaler
 
-# -------------------------------------------------------------
+
 def read_list(txt: str):
     with open(txt) as fh:
         return [ln.strip() for ln in fh if ln.strip()]
+
 
 # ───────────────────────── Dataset ────────────────────────────
 class ErrorDataset(Dataset):
@@ -68,6 +68,7 @@ class ErrorDataset(Dataset):
             self.y[i]
         )
 
+
 # ───────────────────────── Network ────────────────────────────
 class SNPTransformerEncoder(nn.Module):
     def __init__(self, n_haps:int, embed:int=64, heads:int=4, layers:int=3):
@@ -82,6 +83,7 @@ class SNPTransformerEncoder(nn.Module):
         z = self.enc(z)
         w = F.softmax(self.pool(z), dim=1)
         return (w * z).sum(dim=1)
+
 
 class TabularRegressor(nn.Module):
     def __init__(self, inp:int, hidden=(256,128), drop=0.3):
@@ -98,6 +100,7 @@ class TabularRegressor(nn.Module):
 
     def forward(self, x): return self.net(x).squeeze(1)
 
+
 class Predictor(nn.Module):
     def __init__(self, n_haps:int, n_tab:int, embed:int=64, dropout:float=0.3):
         super().__init__()
@@ -107,6 +110,7 @@ class Predictor(nn.Module):
     def forward(self, Xraw, Xtab):
         z = self.enc(Xraw)
         return self.reg(torch.cat([z, Xtab], dim=1))
+
 
 # ──────────────────────── training fn ─────────────────────────
 def train(model, train_loader, val_loader,
@@ -148,10 +152,17 @@ def train(model, train_loader, val_loader,
                 preds.append(pred.cpu().numpy())
                 trues.append(y.cpu().numpy())
         val_mse = vtot / len(val_loader.dataset)
-        val_r2  = r2_score(
-            np.concatenate(trues),
-            np.concatenate(preds)
-        )
+
+        # concatenate & drop any non-finite pairs before R²
+        y_true = np.concatenate(trues)
+        y_pred = np.concatenate(preds)
+        finite = np.isfinite(y_true) & np.isfinite(y_pred)
+        if not finite.all():
+            print(f"[trainer] ⚠️  dropping {len(finite)-finite.sum()} NaN/Inf predictions", file=sys.stderr)
+            y_true = y_true[finite]
+            y_pred = y_pred[finite]
+
+        val_r2  = r2_score(y_true, y_pred)
         sched.step(val_mse)
 
         # optionally save best
@@ -168,11 +179,10 @@ def train(model, train_loader, val_loader,
             }, best_ckpt_path)
             print(f"[trainer] 🏆 new-best R²={val_r2:.3f}, saved to {best_ckpt_path}")
 
-        # record metrics & update best
+        # record & rolling checkpoint
         history.append((epoch, train_mse, val_mse, val_r2))
         best_r2 = max(best_r2, val_r2)
 
-        # ---- rolling checkpoint ----
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -189,6 +199,7 @@ def train(model, train_loader, val_loader,
               flush=True)
 
     return best_r2, history
+
 
 # ─────────────────────────── main ─────────────────────────────
 def main():
@@ -212,29 +223,46 @@ def main():
     ap.add_argument("--model-name",     default=None,
                     help="root name for checkpoint and final model files")
     ap.add_argument("--save-best",      action="store_true",
-                    help="also save the best model seen so far to <model-name>_best.pt")
+                    help="also save the best model seen so far")
     args = ap.parse_args()
 
     # device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[trainer] device = {device}", file=sys.stderr)
 
-    # lists & tables
+    # read feature & haplotype column lists
     feat_cols = read_list(args.feature_list)
     hap_cols  = read_list(args.hap_names_file)
 
+    # load your features CSV
     feat_df = pd.read_csv(args.features_csv)
     if args.region:
         feat_df = feat_df.query("chrom == @args.region").reset_index(drop=True)
 
-    # — correct NaN‐masking here —
+    # 1) check for missing columns
+    missing = set(feat_cols) - set(feat_df.columns)
+    if missing:
+        print(f"[trainer] ✗ Missing feature columns in {args.features_csv}: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+    # 2) pull out feature matrix & replace infinities
     X_tab_df = feat_df[feat_cols].replace([np.inf, -np.inf], np.nan)
+    before   = len(feat_df)
     mask     = ~X_tab_df.isna().any(axis=1)
     feat_df  = feat_df.loc[mask].reset_index(drop=True)
     X_tab    = X_tab_df.loc[mask].values
+    after    = len(feat_df)
+    print(f"[trainer] dropped {before-after} rows with NaN/Inf in features", file=sys.stderr)
 
-    y_all    = feat_df["error"].clip(lower=1e-8).values
+    # 3) sanity check: no NaNs left
+    if np.isnan(X_tab).any():
+        print(f"[trainer] ✗ Still found NaNs after cleaning—aborting", file=sys.stderr)
+        sys.exit(1)
 
+    # target
+    y_all = feat_df["error"].clip(lower=1e-8).values
+
+    # load SNP‐freqs
     snp_df = pd.read_csv(args.snp_freqs_csv)
     if args.region:
         snp_df = snp_df.query("chrom == @args.region").reset_index(drop=True)
@@ -248,7 +276,7 @@ def main():
     scaler = StandardScaler().fit(X_tab[tr_idx])
     X_scaled = scaler.transform(X_tab)
 
-    # datasets & loaders
+    # build datasets & loaders
     train_ds = ErrorDataset(feat_df, snp_df, tr_idx, X_scaled, y_all,
                             args.max_snps, hap_cols)
     val_ds   = ErrorDataset(feat_df, snp_df, val_idx, X_scaled, y_all,
@@ -263,7 +291,7 @@ def main():
                               pin_memory=True,
                               persistent_workers=(args.workers>0))
 
-    # model & optimizer
+    # model & optimizer setup
     region_label = args.region or "ALL"
     model_name   = args.model_name or f"predictor_{region_label}"
     ckpt_path    = f"{model_name}.pt"
@@ -281,7 +309,7 @@ def main():
                                                  patience=4)
     gscaler= GradScaler()
 
-    # resume?
+    # resume state if checkpoint exists
     start_epoch, best_r2, history = 1, -math.inf, []
     if os.path.exists(ckpt_path):
         add_safe_globals([marray._reconstruct])
@@ -298,7 +326,7 @@ def main():
         print(f"[trainer] resumed from {ckpt_path} (epoch {start_epoch})",
               file=sys.stderr)
 
-    # train!
+    # run training loop
     best_r2, history = train(
         model, train_loader, val_loader,
         opt, sched, gscaler, device,
@@ -309,7 +337,7 @@ def main():
         region_label=region_label
     )
 
-    # final artifacts
+    # save final artifacts
     pd.DataFrame(history,
                  columns=["epoch","train_mse","val_mse","val_r2"]
                 ).to_csv(f"training_history_{model_name}.csv",
@@ -318,6 +346,7 @@ def main():
                f"{model_name}.pth")
 
     print("[trainer] done ✓", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()

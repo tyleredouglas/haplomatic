@@ -89,6 +89,7 @@ class FixedWindowGenerator:
                 win_df = obs.query("@start <= pos < @end").reset_index(drop=True)
                 if len(win_df) < self.min_snps:
                     continue
+                # pick nearest true-frequency row by window midpoint
                 mid_idx = (true_freqs.pos - win_df.pos.median()).abs().idxmin()
                 true_row = true_freqs.loc[mid_idx, founder_cols].values
                 results[(sim_col,(start,end))] = {
@@ -156,7 +157,12 @@ class FeatureBuilder:
             sig     = sigma_draw.mean() if sigma_draw.size else 1.0
             H       = (X.T@X)/(sig**2+1e-8)
             imp_g   = float(np.log(np.median(1/(np.abs(np.linalg.eigvals(H))+1e-8))+1e-8))
+
+            # compute the true‐error **only once**, then **skip** if it's NaN
             err     = float(np.abs(p_mean - info["true_freq_row"]).sum())
+            if not np.isfinite(err):
+                # no valid ground-truth here → skip emitting this row
+                continue
 
             # LSEI + avg SNP‐freq
             lsei = lsei_haplotype_estimator(X,b)
@@ -188,8 +194,10 @@ class FeatureBuilder:
               effective_rank=compute_effective_rank(X),
               divergence_rate=div_rt,
               avg_tree_depth=td,
-              Predicted_Error=float(np.nan),  # placeholder
-              True_Error=err
+-             Predicted_Error=float(np.nan),
+-             True_Error=err
++             Predicted_Error=float(np.nan),
++             error=err
             )
             for i,c in enumerate(founder_cols):
                 rec[f"lsei_{c}"]        = float(lsei[i])
@@ -246,16 +254,15 @@ def main() -> None:
         done = set(zip(prev.sim, prev.start, prev.end))
 
     BATCH_SIZE = 2000
-    workers    = args.workers
-    pool       = ProcessPoolExecutor(max_workers=workers) if workers>1 else None
+    pool       = ProcessPoolExecutor(max_workers=args.workers) \
+                   if args.workers>1 else None
 
-    # iterate populations
     for pop in pops:
         print(f"[windows] processing {pop}", file=sys.stderr)
         tf = Path(args.true_freq_dir)/f"{pop}_true_freqs.csv"
         if not tf.exists():
             raise FileNotFoundError(tf)
-        true_df = pd.read_csv(tf).loc[:,["pos",*founders]]
+        true_df = pd.read_csv(tf).loc[:, ["pos", *founders]]
 
         # build task list
         windows = gen.generate(
@@ -271,10 +278,9 @@ def main() -> None:
         # process in batches
         for i in range(0, len(tasks), BATCH_SIZE):
             batch = tasks[i:i+BATCH_SIZE]
-            if pool:
-                dfs = list(pool.map(_worker_build, batch))
-            else:
-                dfs = [ _worker_build(t) for t in batch ]
+            dfs = (list(pool.map(_worker_build, batch))
+                   if pool else
+                   [_worker_build(t) for t in batch])
             chunk = pd.concat(dfs, ignore_index=True)
 
             chunk.to_csv(
@@ -290,6 +296,7 @@ def main() -> None:
                 done.add((pop, key[1][0], key[1][1]))
 
     print("Done. windows written to", out_path, file=sys.stderr)
+
 
 if __name__=="__main__":
     main()

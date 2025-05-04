@@ -188,8 +188,7 @@ class FeatureBuilder:
               effective_rank=compute_effective_rank(X),
               divergence_rate=div_rt,
               avg_tree_depth=td,
-              Predicted_Error=float(np.nan),  # placeholder
-              True_Error=err
+              error=err
             )
             for i,c in enumerate(founder_cols):
                 rec[f"lsei_{c}"]        = float(lsei[i])

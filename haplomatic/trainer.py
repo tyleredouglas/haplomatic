@@ -177,7 +177,7 @@ def train(model, train_loader, val_loader,
                 "best_r2":          val_r2,
                 "history":          history + [(epoch, train_mse, val_mse, val_r2)]
             }, best_ckpt_path)
-            print(f"[trainer] 🏆 new-best R²={val_r2:.3f}, saved to {best_ckpt_path}")
+            print(f"[new best R²={val_r2:.3f}, saved to {best_ckpt_path}")
 
         # record & rolling checkpoint
         history.append((epoch, train_mse, val_mse, val_r2))
@@ -195,7 +195,7 @@ def train(model, train_loader, val_loader,
         }, ckpt_path)
 
         print(f"[{region_label}] epoch {epoch:02d} "
-              f"trainMSE={train_mse:.4e} valMSE={val_mse:.4e} R²={val_r2:.3f}",
+              f"train MSE={train_mse:.4e} val MSE={val_mse:.4e} R²={val_r2:.3f}",
               flush=True)
 
     return best_r2, history
@@ -228,7 +228,7 @@ def main():
 
     # device
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[trainer] device = {device}", file=sys.stderr)
+    print(f"device = {device}", file=sys.stderr)
 
     # read feature & haplotype column lists
     feat_cols = read_list(args.feature_list)
@@ -242,7 +242,7 @@ def main():
     # 1) check for missing columns
     missing = set(feat_cols) - set(feat_df.columns)
     if missing:
-        print(f"[trainer] ✗ Missing feature columns in {args.features_csv}: {missing}", file=sys.stderr)
+        print(f"Missing feature columns in {args.features_csv}: {missing}", file=sys.stderr)
         sys.exit(1)
 
     # 2) pull out feature matrix & replace infinities
@@ -256,7 +256,7 @@ def main():
 
     # 3) sanity check: no NaNs left
     if np.isnan(X_tab).any():
-        print(f"[trainer] ✗ Still found NaNs after cleaning—aborting", file=sys.stderr)
+        print(f"NaNs still found after cleaning—aborting", file=sys.stderr)
         sys.exit(1)
 
     # target
@@ -345,7 +345,7 @@ def main():
     torch.save(model.state_dict(),
                f"{model_name}.pth")
 
-    print("[trainer] done ✓", file=sys.stderr)
+    print("training complete", file=sys.stderr)
 
 
 if __name__ == "__main__":

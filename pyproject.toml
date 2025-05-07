@@ -22,7 +22,7 @@ dependencies = [
 haplomatic-sim    = "haplomatic.sim:main"
 haplomatic-window = "haplomatic.windows:main"
 haplomatic-train  = "haplomatic.trainer:main"
-haplomatic-adaptive = "haplomatic.adaptive:main"
+haplomatic-validate = "haplomatic.validate:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

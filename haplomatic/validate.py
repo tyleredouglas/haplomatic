@@ -480,15 +480,15 @@ def main():
                 mask = (resume_df["region"] == region_str) & (resume_df["sim"] == sim)
                 if mask.any():
                     last_start = resume_df.loc[mask, "start"].max()
-                    resume_pos = last_start + args.step_start
+                    resume_pos  = last_start + args.step_start
                     print(f"Resuming {region_str}, sim={sim} from pos > {resume_pos}")
                     logger.info(f"Resuming {region_str}, sim={sim} from pos > {resume_pos}")
                     subset = subset_all[subset_all.pos > resume_pos].reset_index(drop=True)
                 else:
                     subset = subset_all.copy()
-
             else:
                 subset = subset_all.copy()
+
             if subset.empty:
                 continue
             true_df = None

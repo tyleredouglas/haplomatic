@@ -127,15 +127,20 @@ def compute_effective_rank(X: np.ndarray) -> float:
     ent      = -np.sum(s_norm*np.log(s_norm+1e-8))
     return float(np.exp(ent))
 
-def clean_features(feats: dict[str,float],
-                   clip_min: float=-1e6,
-                   clip_max: float=1e6) -> dict[str,float]:
-    for k,v in feats.items():
-        if isinstance(v,(int,float,np.number)):
-            vv = np.nan_to_num(v,nan=0.0,
-                              posinf=clip_max,
-                              neginf=clip_min)
-            feats[k] = float(np.clip(vv,clip_min,clip_max))
+def clean_features(feats: dict[str, float],
+                   clip_min: float = -1e6,
+                   clip_max: float = 1e6) -> dict[str, float]:
+
+    for k, v in feats.items():
+        # never clip the raw window bounds
+        if k in ("start", "end"):
+            continue
+        if isinstance(v, (int, float, np.number)):
+            vv = np.nan_to_num(v,
+                               nan=0.0,
+                               posinf=clip_max,
+                               neginf=clip_min)
+            feats[k] = float(np.clip(vv, clip_min, clip_max))
     return feats
 
 def extract_window_features(window_df: pd.DataFrame, sim: str,
@@ -251,6 +256,7 @@ def adaptive_windowing(
     extra_sizes = [coarse_sizes[-1]+50000, coarse_sizes[-1]+100000]
 
     while start < end:
+        bumped = False
         best, found, curr_thr = None, False, err_thr
 
         # Phase 1: coarse scan
@@ -370,16 +376,16 @@ def adaptive_windowing(
 
         # write record immediately
         rec = {
-            "chrom":df.chrom.iloc[0],
-            "region":region,
-            "sim":sim,
-            "start":start,
-            "end":best["we"],
-            "window_bp":best["cs"],
-            "Predicted_Error":best["pe"],
-            "error":best["te"]
+            "chrom": df.chrom.iloc[0],
+            "region": region,
+            "sim": sim,
+            "start": int(best["feats"]["start"]),
+            "end":   int(best["feats"]["end"]),
+            "window_bp": best["cs"],
+            "Predicted_Error": best["pe"],
+            "error": best["te"]
         }
-        rec.update({k:v for k,v in best["feats"].items() if k!="error"})
+        rec.update({k: v for k, v in best["feats"].items() if k not in ("error", "start", "end")})
         for h in hap_cols:
             rec[h] = float(best["win"][h].mean()) if not best["win"].empty else np.nan
 

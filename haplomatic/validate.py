@@ -12,7 +12,7 @@ import re
 import csv
 import threading
 from pathlib import Path
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -29,19 +29,20 @@ from numpyro.infer import MCMC, NUTS
 from scipy.optimize import minimize
 from scipy.stats import skew, kurtosis
 
-# Globals for threaded CSV writing
+# ——— Globals for threaded CSV writing ———
 OUTPUT_FH = None
 CSV_WRITER = None
 WRITE_LOCK = threading.Lock()
-
 
 def setup_logging(log_file: str) -> logging.Logger:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     for h in list(root.handlers):
         root.removeHandler(h)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
@@ -52,11 +53,9 @@ def setup_logging(log_file: str) -> logging.Logger:
     root.addHandler(ch)
     return logging.getLogger(__name__)
 
-
 def read_list_file(path: str) -> list[str]:
     with open(path) as f:
         return [l.strip() for l in f if l.strip()]
-
 
 def read_regions_file(path: str) -> list[tuple[str,int,int]]:
     regions = []
@@ -77,13 +76,11 @@ def read_regions_file(path: str) -> list[tuple[str,int,int]]:
             regions.append((chrom, int(start), int(end)))
     return regions
 
-
 def mcmc_model(X, b):
     p = numpyro.sample("p", dist.Dirichlet(jnp.ones(X.shape[1])))
     sigma = numpyro.sample("sigma", dist.HalfNormal(0.2))
     mu = jnp.dot(X, p)
     numpyro.sample("y_obs", dist.Normal(mu, sigma), obs=b)
-
 
 def mcmc_haplotype_freq(X: np.ndarray, b: np.ndarray,
                         num_warmup: int = 80, num_samples: int = 20,
@@ -103,7 +100,6 @@ def mcmc_haplotype_freq(X: np.ndarray, b: np.ndarray,
     depth = int((jnp.log2(steps + 1e-8).astype(int) + 1).max())
     return p_np, {"divergence_rate": divr, "max_tree_depth": depth}
 
-
 def lsei_haplotype_estimator(X: np.ndarray, b: np.ndarray,
                              lb: float = 0.0) -> np.ndarray:
     k = X.shape[1]
@@ -119,7 +115,6 @@ def lsei_haplotype_estimator(X: np.ndarray, b: np.ndarray,
                        bounds=bounds, constraints=cons)
     return res.x if res.success else np.full(k, np.nan)
 
-
 def compute_avg_snpfreqs(df: pd.DataFrame, sim: str) -> np.ndarray:
     n_haps = sum(1 for c in df.columns if c.startswith("B"))
     out = np.full(n_haps, np.nan)
@@ -130,13 +125,11 @@ def compute_avg_snpfreqs(df: pd.DataFrame, sim: str) -> np.ndarray:
             out[i] = vals[mask].mean()
     return out
 
-
 def compute_effective_rank(X: np.ndarray) -> float:
     U, s, Vt = np.linalg.svd(X, full_matrices=False)
     s_norm = s / (s.sum() + 1e-8)
     ent = -np.sum(s_norm * np.log(s_norm + 1e-8))
     return float(np.exp(ent))
-
 
 def clean_features(feats: dict[str,float],
                    clip_min: float = -1e6,
@@ -149,14 +142,12 @@ def clean_features(feats: dict[str,float],
             feats[k] = float(np.clip(vv, clip_min, clip_max))
     return feats
 
-
 def extract_window_features(window_df: pd.DataFrame, sim: str,
                             true_df: pd.DataFrame|None,
                             hap_cols: list[str]
 ) -> dict[str,float]|None:
     n = len(window_df)
-    if n == 0:
-        return None
+    if n == 0: return None
     start_c = float(window_df.pos.min())
     end_c   = float(window_df.pos.max())
     window_bp = end_c - start_c + 1
@@ -207,7 +198,6 @@ def extract_window_features(window_df: pd.DataFrame, sim: str,
         feats["error"] = float(np.abs(p_samps.mean(axis=0)-true_row).sum())
     return clean_features(feats)
 
-
 class SNPTransformerEncoder(nn.Module):
     def __init__(self, n_haps, embed_dim=64, heads=4, layers=3):
         super().__init__()
@@ -215,13 +205,11 @@ class SNPTransformerEncoder(nn.Module):
         blk = nn.TransformerEncoderLayer(embed_dim, heads, batch_first=True)
         self.enc = nn.TransformerEncoder(blk, layers)
         self.pool = nn.Linear(embed_dim, 1)
-
     def forward(self, x):
         z = self.proj(x)
         z = self.enc(z)
         w = F.softmax(self.pool(z), dim=1)
         return (w * z).sum(dim=1)
-
 
 class TabularRegressor(nn.Module):
     def __init__(self, inp, hidden=(256,128), drop=0.3):
@@ -236,21 +224,17 @@ class TabularRegressor(nn.Module):
             ]
         layers.append(nn.Linear(dims[-1], 1))
         self.net = nn.Sequential(*layers)
-
     def forward(self, x):
         return self.net(x).squeeze(1)
-
 
 class Predictor(nn.Module):
     def __init__(self, n_haps, n_tab, embed_dim=64):
         super().__init__()
         self.enc = SNPTransformerEncoder(n_haps, embed_dim)
         self.reg = TabularRegressor(embed_dim + n_tab)
-
     def forward(self, Xraw, Xtab):
         z = self.enc(Xraw)
         return self.reg(torch.cat([z, Xtab], dim=1))
-
 
 def adaptive_windowing(
     df, sim, region, true_df,
@@ -258,8 +242,6 @@ def adaptive_windowing(
     hap_cols, coarse_sizes, step_refine,
     min_snps, max_snps, step_start
 ):
-    global OUTPUT_FH, CSV_WRITER
-
     logger = logging.getLogger(__name__)
     cols = scaler.feature_names_in_
     start, end = int(df.pos.min()), int(df.pos.max())
@@ -268,6 +250,19 @@ def adaptive_windowing(
     logger.info(f"Coarse sizes: {coarse_sizes}, refine step: {step_refine}bp")
 
     extra_sizes = [coarse_sizes[-1] + 50000, coarse_sizes[-1] + 100000]
+    buffer = []
+
+    def write_buffer():
+        nonlocal buffer
+        with WRITE_LOCK:
+            global CSV_WRITER
+            if CSV_WRITER is None:
+                # first time: set fieldnames & write header
+                CSV_WRITER = csv.DictWriter(OUTPUT_FH, fieldnames=list(buffer[0].keys()))
+                CSV_WRITER.writeheader()
+            CSV_WRITER.writerows(buffer)
+            OUTPUT_FH.flush()
+        buffer = []
 
     while start < end:
         best, found, curr_thr = None, False, err_thr
@@ -296,6 +291,7 @@ def adaptive_windowing(
             with torch.no_grad():
                 pe = float(model(Xr, X_tab).item())
             te = feats.get("error", np.nan)
+
             logger.info(f"  Window {start}-{we} ({cs}bp): Pred={pe:.4f}, True={te:.4f}")
 
             if best is None or pe < best["pe"]:
@@ -305,6 +301,7 @@ def adaptive_windowing(
                 found = True
                 break
 
+        # fallback/extras
         if not found and best:
             slack_thr = err_thr + 0.05
             if best["pe"] <= slack_thr:
@@ -317,12 +314,14 @@ def adaptive_windowing(
                     win = df[(df.pos >= start) & (df.pos < we)]
                     if len(win) < min_snps:
                         continue
+
                     feats = extract_window_features(win, sim, true_df, hap_cols)
                     if not feats:
                         continue
                     meta = pd.DataFrame([feats])[cols].replace([np.inf, -np.inf], np.nan)
                     if meta.isna().any(axis=1).item():
                         continue
+
                     X_tab = torch.tensor(scaler.transform(meta), dtype=torch.float32)
                     M = win[hap_cols].astype(float).values
                     if len(M) > max_snps:
@@ -333,6 +332,7 @@ def adaptive_windowing(
                     with torch.no_grad():
                         pe = float(model(Xr, X_tab).item())
                     te = feats.get("error", np.nan)
+
                     logger.info(f"  extra window {cs}bp: Pred={pe:.4f}, True={te:.4f}")
                     if pe < best["pe"]:
                         best = {"pe": pe, "we": we, "cs": cs, "te": te, "feats": feats, "win": win}
@@ -346,18 +346,21 @@ def adaptive_windowing(
         prev = [s for s in coarse_sizes if s < cs0]
         low = prev[-1] if prev else coarse_sizes[0]
         refine_thr = err_thr + refine_flex
+
         logger.info(f"  refine between {low}–{cs0}bp in steps of {step_refine}bp")
         for W in range(low, cs0 + 1, step_refine):
             we = start + W
             win = df[(df.pos >= start) & (df.pos < we)]
             if len(win) < min_snps:
                 continue
+
             feats = extract_window_features(win, sim, true_df, hap_cols)
             if not feats:
                 continue
             meta = pd.DataFrame([feats])[cols].replace([np.inf, -np.inf], np.nan)
             if meta.isna().any(axis=1).item():
                 continue
+
             X_tab = torch.tensor(scaler.transform(meta), dtype=torch.float32)
             M = win[hap_cols].astype(float).values
             if len(M) > max_snps:
@@ -368,13 +371,14 @@ def adaptive_windowing(
             with torch.no_grad():
                 pe = float(model(Xr, X_tab).item())
             te = feats.get("error", np.nan)
+
             logger.info(f"    refine {W}bp: Pred={pe:.4f}, True={te:.4f}")
             if pe < best["pe"] or pe <= refine_thr:
                 logger.info(f"      refine hit @ {W}bp: {pe:.4f} ≤ {refine_thr:.4f}")
                 best = {"pe": pe, "we": we, "cs": W, "te": te, "feats": feats, "win": win}
                 break
 
-        # write record
+        # record one window
         rec = {
             "chrom": df.chrom.iloc[0],
             "region": region,
@@ -383,7 +387,7 @@ def adaptive_windowing(
             "end": best["we"],
             "window_bp": best["cs"],
             "Predicted_Error": best["pe"],
-            "error": best["te"]
+            "error": best["te"],
         }
         for k, v in best["feats"].items():
             if k not in ("start", "end", "window_bp", "error"):
@@ -391,18 +395,19 @@ def adaptive_windowing(
         for h in hap_cols:
             rec[h] = float(best["win"][h].mean()) if not best["win"].empty else np.nan
 
-        with WRITE_LOCK:
-            if CSV_WRITER is None:
-                CSV_WRITER = csv.DictWriter(OUTPUT_FH, fieldnames=list(rec.keys()))
-                CSV_WRITER.writeheader()
-            CSV_WRITER.writerow(rec)
-            OUTPUT_FH.flush()
+        buffer.append(rec)
+        # flush every 5 windows
+        if len(buffer) >= 5:
+            write_buffer()
 
         nxt = df[df.pos >= start + step_start]
         if nxt.empty:
             break
         start = int(nxt.pos.iloc[0])
 
+    # final flush
+    if buffer:
+        write_buffer()
 
 def main():
     parser = argparse.ArgumentParser(description="haplomatic-validate")
@@ -422,30 +427,23 @@ def main():
                         default="30001,50001,70001,90001,120001,150001,200001,250001")
     parser.add_argument("--refine-step",     type=int, default=5000)
     parser.add_argument("--step-start",      type=int, default=20000,
-                        help="advance window by this many bp after recording (default 20000)")
+                        help="advance window by this many bp after recording")
     parser.add_argument("--min-snps",        type=int, default=10,
-                        help="minimum SNPs per window (default 10)")
+                        help="minimum SNPs per window")
     parser.add_argument("--max-snps",        type=int, default=400,
-                        help="maximum SNPs per window for model input (default 400)")
+                        help="maximum SNPs per window for model input")
     parser.add_argument("--workers",         type=int, default=1,
-                        help="number of parallel workers (default 1)")
+                        help="number of parallel worker threads")
     args = parser.parse_args()
 
     logger = setup_logging(args.log_file)
 
-    # open output
+    # open output CSV
     global OUTPUT_FH, CSV_WRITER
-    output_path = Path(args.output)
-    if output_path.exists() and output_path.stat().st_size > 0:
-        resume_df = pd.read_csv(args.output)
-        print(f"Resuming from existing output ({len(resume_df)} rows)")
-        logger.info(f"Resuming from existing output ({len(resume_df)} rows)")
-        OUTPUT_FH = open(args.output, "a", newline="")
-        CSV_WRITER = csv.DictWriter(OUTPUT_FH, fieldnames=resume_df.columns)
-    else:
-        resume_df = None
-        OUTPUT_FH = open(args.output, "w", newline="")
-        CSV_WRITER = None
+    out_path = Path(args.output)
+    first = not (out_path.exists() and out_path.stat().st_size > 0)
+    OUTPUT_FH = open(args.output, "a" if not first else "w", newline="")
+    CSV_WRITER = None
 
     # load model + scaler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -466,12 +464,13 @@ def main():
     coarse_sizes = [int(x) for x in args.coarse_sizes.split(",")]
 
     # prepare tasks
+    resume_df = pd.read_csv(args.output) if not first else None
     tasks = []
     for chrom, rstart, rend in regions:
-        subset_all = pd.read_csv(args.snp_freqs).query(
+        df_all = pd.read_csv(args.snp_freqs).query(
             "chrom == @chrom and pos >= @rstart and pos <= @rend"
         ).reset_index(drop=True)
-        if subset_all.empty:
+        if df_all.empty:
             logger.warning(f"No SNPs in {chrom}:{rstart}-{rend}")
             continue
         region_str = f"{chrom}:{rstart}-{rend}"
@@ -483,12 +482,11 @@ def main():
                     resume_pos  = last_start + args.step_start
                     print(f"Resuming {region_str}, sim={sim} from pos > {resume_pos}")
                     logger.info(f"Resuming {region_str}, sim={sim} from pos > {resume_pos}")
-                    subset = subset_all[subset_all.pos > resume_pos].reset_index(drop=True)
+                    subset = df_all[df_all.pos > resume_pos].reset_index(drop=True)
                 else:
-                    subset = subset_all.copy()
+                    subset = df_all.copy()
             else:
-                subset = subset_all.copy()
-
+                subset = df_all.copy()
             if subset.empty:
                 continue
             true_df = None
@@ -496,45 +494,21 @@ def main():
                 tf = Path(args.true_freq_dir) / f"{sim}_true_freqs.csv"
                 if tf.exists():
                     true_df = pd.read_csv(tf)
-            tasks.append((subset, sim, region_str, true_df))
+            tasks.append((subset, sim, region_str, true_df,
+                          model, scaler,
+                          args.error_threshold, args.flex, args.refine_flex,
+                          hap_cols, coarse_sizes, args.refine_step,
+                          args.min_snps, args.max_snps, args.step_start))
 
-    # run
+    # execute in parallel threads
     if args.workers > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futures = [
-                ex.submit(
-                    adaptive_windowing,
-                    subset, sim, region, true_df,
-                    model, scaler,
-                    args.error_threshold,
-                    args.flex,
-                    args.refine_flex,
-                    hap_cols,
-                    coarse_sizes,
-                    args.refine_step,
-                    args.min_snps,
-                    args.max_snps,
-                    args.step_start
-                )
-                for subset, sim, region, true_df in tasks
-            ]
-            for _ in concurrent.futures.as_completed(futures):
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = [ex.submit(adaptive_windowing, *t) for t in tasks]
+            for _ in as_completed(futures):
                 pass
     else:
-        for subset, sim, region, true_df in tasks:
-            adaptive_windowing(
-                subset, sim, region, true_df,
-                model, scaler,
-                args.error_threshold,
-                args.flex,
-                args.refine_flex,
-                hap_cols,
-                coarse_sizes,
-                args.refine_step,
-                args.min_snps,
-                args.max_snps,
-                args.step_start
-            )
+        for t in tasks:
+            adaptive_windowing(*t)
 
     OUTPUT_FH.close()
     logger.info("HELLO DEBUG: main() complete")

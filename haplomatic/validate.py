@@ -130,9 +130,7 @@ def compute_effective_rank(X: np.ndarray) -> float:
 def clean_features(feats: dict[str, float],
                    clip_min: float = -1e6,
                    clip_max: float = 1e6) -> dict[str, float]:
-
     for k, v in feats.items():
-        # never clip the raw window bounds
         if k in ("start", "end"):
             continue
         if isinstance(v, (int, float, np.number)):
@@ -390,9 +388,6 @@ def adaptive_windowing(
             rec[h] = float(best["win"][h].mean()) if not best["win"].empty else np.nan
 
         with WRITE_LOCK:
-            if CSV_WRITER is None:
-                CSV_WRITER = csv.DictWriter(OUTPUT_FH, fieldnames=list(rec.keys()))
-                CSV_WRITER.writeheader()
             CSV_WRITER.writerow(rec)
             OUTPUT_FH.flush()
 
@@ -415,10 +410,10 @@ def main():
     parser.add_argument("--error-threshold", type=float, required=True)
     parser.add_argument("--flex",            type=float, default=0.025)
     parser.add_argument("--refine-flex",     type=float, default=0.025)
-    parser.add_argument("--coarse-sizes",    type=str,
-                        default="30001,50001,70001,90001,120001,150001,200001,250001")
+    parser.add_argument("--coarse-sizes",    default="30001,50001,70001,90001,120001,150001,200001,250001",
+                        help="comma‑separated coarse window sizes in bp")
     parser.add_argument("--refine-step",     type=int, default=5000)
-    parser.add_argument("--step-start",      type=int, default=20000,
+    parser.add_argument("--step-start",      "--step", type=int, default=20000,
                         help="advance window by this many bp after recording")
     parser.add_argument("--min-snps",        type=int, default=10,
                         help="minimum SNPs per window")
@@ -426,21 +421,41 @@ def main():
                         help="maximum SNPs per window for model input")
     args = parser.parse_args()
 
+    # turn the comma‑string into integers
+    coarse_sizes = [int(x) for x in args.coarse_sizes.split(",")]
+
+    # build one canonical list of output columns:
+    static_cols  = ["chrom","region","sim","start","end","window_bp","Predicted_Error","error"]
+    raw_features = read_list_file(args.features)
+    hap_cols     = read_list_file(args.hap_names_file)
+    # drop any feature names that collide with static or hap columns
+    feature_cols = [f for f in raw_features if f not in static_cols and f not in hap_cols]
+    fieldnames   = static_cols + feature_cols + hap_cols
+
     logger = setup_logging(args.log_file)
 
     # open output and handle resume
     global OUTPUT_FH, CSV_WRITER
     out_path = Path(args.output)
-    if out_path.exists() and out_path.stat().st_size>0:
+    if out_path.exists() and out_path.stat().st_size > 0:
         resume_df = pd.read_csv(args.output)
         print(f"Resuming from existing output ({len(resume_df)} rows)")
         logger.info(f"Resuming from existing output ({len(resume_df)} rows)")
         OUTPUT_FH = open(args.output, "a", newline="")
-        CSV_WRITER = None
+        CSV_WRITER = csv.DictWriter(
+            OUTPUT_FH,
+            fieldnames=fieldnames,
+            extrasaction='ignore'
+        )
     else:
         resume_df = None
         OUTPUT_FH = open(args.output, "w", newline="")
-        CSV_WRITER = None
+        CSV_WRITER = csv.DictWriter(
+            OUTPUT_FH,
+            fieldnames=fieldnames,
+            extrasaction='ignore'
+        )
+        CSV_WRITER.writeheader()
 
     # load model + scaler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -455,12 +470,9 @@ def main():
     scaler.scale_            = ckpt["scaler_scale"]
     scaler.feature_names_in_ = np.array(read_list_file(args.features))
 
-    sims       = read_list_file(args.sims)
-    regions    = read_regions_file(args.regions)
-    hap_cols   = read_list_file(args.hap_names_file)
-    coarse_szs = [int(x) for x in args.coarse_sizes.split(",")]
+    sims    = read_list_file(args.sims)
+    regions = read_regions_file(args.regions)
 
-    # run sequentially
     for chrom, rstart, rend in regions:
         df_all = pd.read_csv(args.snp_freqs).query(
             "chrom==@chrom and pos>=@rstart and pos<=@rend"
@@ -473,7 +485,7 @@ def main():
             if resume_df is not None:
                 mask = (resume_df["region"]==region_str)&(resume_df["sim"]==sim)
                 if mask.any():
-                    last_start = resume_df.loc[mask,"start"].max()
+                    last_start = int(resume_df.loc[mask,"start"].max())
                     resume_pos  = last_start + args.step_start
                     print(f"Resuming {region_str}, sim={sim} from pos > {resume_pos}")
                     logger.info(f"Resuming {region_str}, sim={sim} from pos > {resume_pos}")
@@ -482,26 +494,25 @@ def main():
                     subset = df_all.copy()
             else:
                 subset = df_all.copy()
-            if subset.empty:
-                continue
-            true_df = None
-            if args.true_freq_dir:
-                tf = Path(args.true_freq_dir)/f"{sim}_true_freqs.csv"
-                if tf.exists():
-                    true_df = pd.read_csv(tf)
-            adaptive_windowing(
-                subset, sim, region_str, true_df,
-                model, scaler,
-                args.error_threshold,
-                args.flex,
-                args.refine_flex,
-                hap_cols,
-                coarse_szs,
-                args.refine_step,
-                args.min_snps,
-                args.max_snps,
-                args.step_start
-            )
+            if not subset.empty:
+                true_df = None
+                if args.true_freq_dir:
+                    tf = Path(args.true_freq_dir)/f"{sim}_true_freqs.csv"
+                    if tf.exists():
+                        true_df = pd.read_csv(tf)
+                adaptive_windowing(
+                    subset, sim, region_str, true_df,
+                    model, scaler,
+                    args.error_threshold,
+                    args.flex,
+                    args.refine_flex,
+                    hap_cols,
+                    coarse_sizes,
+                    args.refine_step,
+                    args.min_snps,
+                    args.max_snps,
+                    args.step_start
+                )
 
     OUTPUT_FH.close()
     logger.info("HELLO DEBUG: main() complete")

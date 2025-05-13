@@ -5,7 +5,6 @@ import random
 from typing import Dict, List, Tuple
 from Bio import SeqIO
 
-
 class ReadSimulator:
     """
     Simulate paired-end reads from a population DataFrame whose index is
@@ -53,18 +52,23 @@ class ReadSimulator:
         self,
         population: pd.DataFrame
     ) -> Tuple[str, int, int, int, int, int, int]:
-        lf = int(round(np.random.normal(150, 10)))
-        lr = int(round(np.random.normal(150, 10)))
+        # draw lengths
+        lf   = int(round(np.random.normal(150, 10)))
+        lr   = int(round(np.random.normal(150, 10)))
         frag = int(round(np.random.normal(500, 50)))
-        gap = frag - (lf + lr)
+        # gap between forward and reverse
+        gap  = frag - (lf + lr)
 
+        # pick contig and random forward start
         contig = random.choice(self.regions)
         chrom_df = population.loc[contig]
         pos_vals = chrom_df.index.get_level_values("pos")
         start_f = random.randint(int(pos_vals.min()), int(pos_vals.max()))
-        end_f = start_f + lf
-        end_r = end_f + gap
-        start_r = end_r + lr
+        end_f   = start_f + lf
+
+        # compute reverse-read coordinates *after* the gap
+        start_r = end_f + gap
+        end_r   = start_r + lr
 
         return contig, start_f, end_f, lf, start_r, end_r, lr
 
@@ -82,6 +86,7 @@ class ReadSimulator:
           {out_prefix}_1.fastq / _2.fastq
         and return a depth table indexed by (contig,pos).
         """
+        # initialize depth counter
         hap_counts = pd.DataFrame(
             0,
             index=population.index,
@@ -93,31 +98,34 @@ class ReadSimulator:
 
             read_cnt = 0
             while read_cnt < n_reads:
+                # unpack coordinates
                 contig, sf, ef, lf, sr, er, lr = self._choose_coordinates(population)
                 chrom_df = population.loc[contig]
 
-                hap_col = random.choice(list(chrom_df.columns))
-                template = chrom_df[hap_col]          # Series indexed by pos (single level)
+                # pick a random haplotype column
+                hap_col  = random.choice(list(chrom_df.columns))
+                template = chrom_df[hap_col]
 
-                # nearest SNP to forward-read start
-                pos_array = template.index.to_numpy()
+                # find nearest SNP to forward-read start
+                pos_array  = template.index.to_numpy()
                 nearest_pos = int(pos_array[np.argmin(np.abs(pos_array - sf))])
-
                 hap = template.loc[nearest_pos]
-                if isinstance(hap, pd.Series):        # duplicate positions safety
+                if isinstance(hap, pd.Series):  # handle duplicate positions
                     hap = hap.iloc[0]
 
+                # increment depth at the SNP
                 hap_counts.at[(contig, nearest_pos), hap] += 1
-                read_cnt += 1
+
+                # generate read sequences
+                fwd_seq = self.sequences[contig][hap][sf:ef]
+                rev_seq = self.reverse_complement(
+                    self.sequences[contig][hap][sr:er]
+                )[::-1]
+
                 read_id = random.randint(1000, 9999)
-
-                seq_dict = self.sequences[contig]
-                hap_seq = seq_dict[hap]
-
-                fwd_seq = hap_seq[sf:ef]
-                rev_seq = self.reverse_complement(hap_seq[er:sr])[::-1]
-
                 fq1.write(f"@{contig}_{sf}_{read_id}/1\n{fwd_seq}\n+\n{'I'*len(fwd_seq)}\n")
                 fq2.write(f"@{contig}_{sf}_{read_id}/2\n{rev_seq}\n+\n{'I'*len(rev_seq)}\n")
+
+                read_cnt += 1
 
         return hap_counts

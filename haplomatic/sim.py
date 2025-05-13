@@ -7,6 +7,7 @@ import textwrap
 import pathlib
 import re
 import shutil
+import sys
 import concurrent.futures
 from typing import List, Tuple, Dict
 
@@ -16,26 +17,39 @@ import pandas as pd
 from .pop_simulator import simulate_population, get_true_freqs
 from .read_simulator import ReadSimulator
 
-# ──────────────────────────────────────────────────────────────────────────────
-# required helper utilities
-# ──────────────────────────────────────────────────────────────────────────────
+
 def read_hap_file(path: str) -> List[str]:
     with open(path) as fh:
         return [ln.strip() for ln in fh if ln.strip()]
 
+
 def read_regions_file(path: str) -> List[Tuple[str, int, int]]:
-    out = []
+    out: List[Tuple[str,int,int]] = []
     with open(path) as fh:
         for raw in fh:
             ln = raw.strip()
             if not ln or ln.startswith("#"):
                 continue
-            if re.match(r"^[^:\s]+:\d+:\d+$", ln):         
-                chrom, start, end = ln.split(":")
-            else:                                          
-                chrom, start, end, *_ = ln.split()
+
+            # chrom:start:end
+            m = re.match(r"^([^:\s]+):(\d+):(\d+)$", ln)
+            if m:
+                chrom, start, end = m.groups()
+            else:
+                # chrom:start-end
+                m2 = re.match(r"^([^:\s]+):(\d+)-(\d+)$", ln)
+                if m2:
+                    chrom, start, end = m2.groups()
+                else:
+                    # whitespace-separated
+                    parts = ln.split()
+                    if len(parts) != 3:
+                        raise ValueError(f"Bad region spec: {ln}")
+                    chrom, start, end = parts
+
             out.append((chrom, int(start), int(end)))
     return out
+
 
 def simulate_rils_blocks(
     founder_ids: List[str],
@@ -47,72 +61,56 @@ def simulate_rils_blocks(
     alpha_base: float  = 0.25,
     seed: int | None   = 42,
 ) -> pd.DataFrame:
-    rng          = np.random.default_rng(seed)
-    ril_cols     = [f"RIL{i}" for i in range(1, n_rils + 1)]
-    cur_fndr     = {ril: None for ril in ril_cols}
-    bp_left      = {ril: 0    for ril in ril_cols}
-    records: list[dict] = []
+    rng      = np.random.default_rng(seed)
+    ril_cols = [f"RIL{i}" for i in range(1, n_rils+1)]
+    cur      = {r: None for r in ril_cols}
+    left     = {r: 0    for r in ril_cols}
+    recs: list[dict] = []
+
     for chrom, start, end in regions:
-        for pos in range(start, end + 1, step_bp):
-            active   = rng.choice(founder_ids, size=k_active, replace=False)
-            weights  = rng.dirichlet([alpha_base] * k_active)
+        for pos in range(start, end+1, step_bp):
+            active  = rng.choice(founder_ids, size=k_active, replace=False)
+            weights = rng.dirichlet([alpha_base]*k_active)
             row = {"CHROM": chrom, "pos": pos}
-            for ril in ril_cols:
-                if bp_left[ril] <= 0:
-                    cur_fndr[ril] = rng.choice(active, p=weights)
-                    bp_left[ril]  = max(int(rng.exponential(mean_block_bp)), step_bp)
-                row[ril] = cur_fndr[ril]
-                bp_left[ril] -= step_bp
-            records.append(row)
-    return pd.DataFrame.from_records(records)
+            for r in ril_cols:
+                if left[r] <= 0:
+                    cur[r]  = rng.choice(active, p=weights)
+                    left[r] = max(int(rng.exponential(mean_block_bp)), step_bp)
+                row[r] = cur[r]
+                left[r] -= step_bp
+            recs.append(row)
+
+    return pd.DataFrame.from_records(recs)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=textwrap.dedent(
-            """\
+        description=textwrap.dedent("""\
             simulate populations and paired-end reads.
 
             required files
             --------------
               --haplotypes  list.txt        one founder ID per line
-              --regions     regions.bed     contig:start:end
-
-            RIL table
-            ----------
-              • provide one via --ril-df   (CHROM,pos,RIL1..)
-              • OR simulate it with --n-rils etc.
-
-            """
-        ),
+              --regions     regions.txt     contig:start:end (or chrom start end)
+        """)
     )
 
-    # always-required
     p.add_argument("--haplotypes", required=True,
                    help="text file of haplotype IDs")
     p.add_argument("--regions",    required=True,
-                   help="text file of target regions (chrom start end)")
-
-    # RIL table options
+                   help="text file of target regions")
     p.add_argument("--ril-df",
-                   help="CSV, first two columns are contig and position, remaining columns are RILs")
-    p.add_argument("--n-rils",     type=int, default=300,
-                   help="If no --ril-df, number of synthetic RILs to create")
-    p.add_argument("--step-bp",    type=int, default=10_000,
-                   help="Marker spacing for synthetic RIL genotype values")
-    p.add_argument("--mean-block", type=int, default=100_000,
-                   help="mean haplotype block length for synthetic RILs(bp)")
-    p.add_argument("--k-active",   type=int, default=3,
-                   help="haplotypes allowed per locus in RILs")
-    p.add_argument("--alpha-base", type=float, default=0.25,
-                   help="dirichlet for haplotype freq sampling")
-
-    # population evolution + read parameters
-    p.add_argument("--n-flies",     type=int, default=300)
-    p.add_argument("--generations", type=int, default=20)
+                   help="CSV of existing RIL table (CHROM,pos,RIL1..)")
+    p.add_argument("--n-rils",     type=int,   default=300)
+    p.add_argument("--step-bp",    type=int,   default=10_000)
+    p.add_argument("--mean-block", type=int,   default=100_000)
+    p.add_argument("--k-active",   type=int,   default=3)
+    p.add_argument("--alpha-base", type=float, default=0.25)
+    p.add_argument("--n-flies",     type=int,   default=300)
+    p.add_argument("--generations", type=int,   default=20)
     p.add_argument("--recomb-rate", type=float, default=0.5)
-    p.add_argument("--n-sims",      type=int, default=2)
+    p.add_argument("--n-sims",      type=int,   default=2)
 
     grp = p.add_mutually_exclusive_group(required=True)
     grp.add_argument("--coverage",  type=float,
@@ -120,37 +118,31 @@ def main() -> None:
     grp.add_argument("--read-depth", type=int,
                      help="explicit read-pair count (alternative to coverage)")
 
-    # allow user to adjust parallelism
-    p.add_argument(
-        "--threads", "--n-workers",
-        type=int,
-        default=os.cpu_count() or 1,
-        help="number of parallel worker threads for read generation"
-    )
     p.add_argument("--read-length",   type=int, default=150)
     p.add_argument("--founder-fastas", nargs="+", required=True,
                    help="one FASTA per contig (seq IDs = haplotypes)")
     p.add_argument("--contigs", nargs="+", required=True,
-                   help="contig names (must match names in RIL df)")
+                   help="contig names (must match RIL df)")
     p.add_argument("--output-dir", default=".",
-                   help="save results")
+                   help="save results here")
+    p.add_argument("--threads", "--n-workers",
+                   type=int, default=os.cpu_count() or 1,
+                   help="parallel read‐generation threads")
 
     args = p.parse_args()
-    num_workers = args.threads
-    print(f"Using {num_workers} read‐generation threads")
-
     out_dir = pathlib.Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    founder_ids = read_hap_file(args.haplotypes)
-    regions     = read_regions_file(args.regions)
+    # load hap IDs & regions
+    founders = read_hap_file(args.haplotypes)
+    regions  = read_regions_file(args.regions)
 
-    # --- obtain a wide RIL dataframe ----------------------------------------
+    # build or load RIL table
     if args.ril_df:
         ril_df = pd.read_csv(args.ril_df)
     else:
         ril_df = simulate_rils_blocks(
-            founder_ids   = founder_ids,
+            founder_ids   = founders,
             regions       = regions,
             n_rils        = args.n_rils,
             step_bp       = args.step_bp,
@@ -158,42 +150,42 @@ def main() -> None:
             k_active      = args.k_active,
             alpha_base    = args.alpha_base,
         )
-        ril_df.to_csv(out_dir / "seed_RILs.csv", index=False)
-        print(f"outputting synthetic RILs to {out_dir/'seed_rils.csv'}")
+        ril_df.to_csv(out_dir/"seed_RILs.csv", index=False)
+        print(f"wrote synthetic RILs to {out_dir/'seed_RILs.csv'}", file=sys.stderr)
 
-    ril_wide = ril_df.set_index(["CHROM", "pos"]).sort_index()
+    ril_wide = ril_df.set_index(["CHROM","pos"]).sort_index()
 
-    # --- total bp across all requested regions ------------------------------
-    total_bp = sum(end - start + 1 for _, start, end in regions)
+    # compute read depth
+    total_bp = sum(e - s + 1 for _, s, e in regions)
     if args.coverage is not None:
-        bases_per_pair = 2 * args.read_length
-        args.read_depth = math.ceil(args.coverage * total_bp / bases_per_pair)
-        print(f"Target {args.coverage}× ≈ {args.read_depth:,} read-pairs")
+        bp_per_pair = 2 * args.read_length
+        args.read_depth = math.ceil(args.coverage * total_bp / bp_per_pair)
+        print(f"Target {args.coverage}× ≈ {args.read_depth:,} read-pairs", file=sys.stderr)
     else:
-        print(f"Fixed {args.read_depth:,} read-pairs")
+        print(f"Fixed {args.read_depth:,} read-pairs", file=sys.stderr)
 
-    # --- set up read simulator ----------------------------------------------
-    fasta_map: Dict[str, str] = dict(zip(args.contigs, args.founder_fastas))
-    rsim = ReadSimulator(fasta_paths=fasta_map, regions=args.contigs)
+    # set up simulator
+    fasta_map = dict(zip(args.contigs, args.founder_fastas))
+    rsim      = ReadSimulator(fasta_paths=fasta_map, regions=args.contigs)
 
-    # --- run replicate simulations -----------------------------------------
-    for i in range(1, args.n_sims + 1):
-        tag        = f"sim{i}"
-        pop_path   = out_dir / f"{tag}_pop.csv"
-        true_path  = out_dir / f"{tag}_true_freqs.csv"
-        depth_path = out_dir / f"{tag}_depth.csv"
-        fq1_path   = out_dir / f"{tag}_1.fastq"
-        fq2_path   = out_dir / f"{tag}_2.fastq"
+    # run sims
+    for i in range(1, args.n_sims+1):
+        tag       = f"sim{i}"
+        pop_path  = out_dir/f"{tag}_pop.csv"
+        true_path = out_dir/f"{tag}_true_freqs.csv"
+        depth_path= out_dir/f"{tag}_depth.csv"
+        fq1_path  = out_dir/f"{tag}_1.fastq"
+        fq2_path  = out_dir/f"{tag}_2.fastq"
 
-        # resume if everything is already there
-        if pop_path.exists() and true_path.exists() and depth_path.exists() \
-           and fq1_path.exists() and fq2_path.exists():
-            print(f"Skipping {tag}, outputs already exist.")
+        # skip if done
+        if (pop_path.exists() and true_path.exists() and
+            depth_path.exists() and fq1_path.exists() and fq2_path.exists()):
+            print(f"Skipping {tag}, outputs exist.", file=sys.stderr)
             continue
 
-        print(f"\n— {tag} —")
+        print(f"\n— {tag} —", file=sys.stderr)
 
-        # 1) simulate population & true freqs
+        # 1) simulate pop & true freqs
         pop_df  = simulate_population(
             RIL_matrix        = ril_wide,
             n_flies           = args.n_flies,
@@ -201,48 +193,63 @@ def main() -> None:
             recombination_rate= args.recomb_rate,
         )
         pop_df.to_csv(pop_path)
-
-        true_df = get_true_freqs(pop_df)
-        true_df.to_csv(true_path)
+        tf = get_true_freqs(pop_df)
+        tf.to_csv(true_path)
 
         # 2) parallel read generation
-        base_chunk = args.read_depth // num_workers
-        sizes = [
-            base_chunk + (1 if j < args.read_depth % num_workers else 0)
-            for j in range(num_workers)
-        ]
+        num_workers = min(args.threads, args.read_depth)
+        base = args.read_depth // num_workers
+        rem  = args.read_depth % num_workers
+        sizes = [base + (j < rem) for j in range(num_workers)]
 
-        def _gen_chunk(chunk_reads: int, part_prefix: pathlib.Path) -> pd.DataFrame:
-            return rsim.generate_reads(pop_df, chunk_reads, str(part_prefix))
-
+        parts: List[pd.DataFrame] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as exe:
-            futures = [exe.submit(_gen_chunk, sz, out_dir / f"{tag}_part{j}")
-                       for j, sz in enumerate(sizes)]
-            parts = [f.result() for f in futures]
+            futures = [
+                exe.submit(rsim.generate_reads, pop_df, sz, out_dir/f"{tag}_part{j}")
+                for j, sz in enumerate(sizes)
+            ]
+            for f in futures:
+                parts.append(f.result())
 
-        # concatenate FASTQs
+        # 3) sanity-check partial FASTQs
+        for j in range(num_workers):
+            p1 = out_dir/f"{tag}_part{j}_1.fastq"
+            p2 = out_dir/f"{tag}_part{j}_2.fastq"
+            cnt1 = sum(1 for _ in open(p1)) // 4
+            cnt2 = sum(1 for _ in open(p2)) // 4
+            print(f"Part {j} reads: +={cnt1}, -={cnt2}", file=sys.stderr)
+            if cnt1 != cnt2:
+                raise RuntimeError(f"Mismatch in part {j}: {cnt1} vs {cnt2}")
+
+        # 4) stitch FASTQs
         with open(fq1_path, "wb") as out1, open(fq2_path, "wb") as out2:
-            for j in range(len(parts)):
-                p1 = out_dir / f"{tag}_part{j}_1.fastq"
-                p2 = out_dir / f"{tag}_part{j}_2.fastq"
-                with open(p1, "rb") as in1:
-                    shutil.copyfileobj(in1, out1)
-                with open(p2, "rb") as in2:
-                    shutil.copyfileobj(in2, out2)
-                p1.unlink()
-                p2.unlink()
+            for j in range(num_workers):
+                p1 = out_dir/f"{tag}_part{j}_1.fastq"
+                p2 = out_dir/f"{tag}_part{j}_2.fastq"
+                with open(p1, "rb") as r1: shutil.copyfileobj(r1, out1)
+                with open(p2, "rb") as r2: shutil.copyfileobj(r2, out2)
+                p1.unlink(); p2.unlink()
 
-        # sum up depth tables
+        # final FASTQ counts
+        fwd_tot = sum(1 for _ in open(fq1_path)) // 4
+        rev_tot = sum(1 for _ in open(fq2_path)) // 4
+        print(f"Total reads: +={fwd_tot}, -={rev_tot}", file=sys.stderr)
+        if fwd_tot != rev_tot:
+            raise RuntimeError(f"Final mismatch: {fwd_tot} vs {rev_tot}")
+        if fwd_tot != args.read_depth:
+            print(f"Warning: generated {fwd_tot} ≠ requested {args.read_depth}", file=sys.stderr)
+
+        # 5) merge depth tables
         depth_df = parts[0]
-        for df_chunk in parts[1:]:
-            depth_df = depth_df.add(df_chunk, fill_value=0).astype(int)
+        for dfc in parts[1:]:
+            depth_df = depth_df.add(dfc, fill_value=0).astype(int)
         depth_df.to_csv(depth_path)
 
-        empirical_cov = depth_df.values.sum() * args.read_length * 2 / total_bp
-        print(f"read-pairs         : {args.read_depth:,}")
-        print(f"coverage           : {empirical_cov:,.2f}×")
+        emp_cov = depth_df.values.sum() * args.read_length * 2 / total_bp
+        print(f"Coverage for {tag}: {emp_cov:.2f}×", file=sys.stderr)
 
-    print("\nsimulations complete.")
+    print("\nAll simulations complete.", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
